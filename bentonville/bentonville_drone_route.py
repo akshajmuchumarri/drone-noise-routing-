@@ -1,5 +1,3 @@
-
-
 import math, heapq, os, sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,14 +9,15 @@ from rasterio.transform import from_bounds
 
 
 grid = 600
-cache = "bentonville_osm.gpkg"
+polygon_cache = "bentonville_osm.gpkg"
+road_cache = "bentonville_roads.gpkg"
 start_coordinates = (36.3236, -94.2556)   # Walmart drone industrial area
 end_coordinates    = (36.3854, -94.2256)   # Bentonville residential (can change location to go through nature areas))
 
 noise_costs = {
-    "industrial": 8, "commercial": 20, "wood": 30, "wetland": 35,
-    "residential": 50, "farmland": 55, "religious": 75,
-    "school": 100, "hospital": 200,
+    "industrial": 10, "motorway": 12, "trunk": 12, "primary": 15, "secondary": 18,
+    "tertiary": 20, "residential": 75, "service": 20, "unclassified": 13,
+    "commercial": 35, "religious": 90, "farmland": 50, "school": 120, "hospital": 150, "wetland": 50, "wood": 45, "park": 45, 
 }
 fill_cost = 1
 
@@ -26,43 +25,60 @@ zone_colors = {
     "industrial": "#b5b5b5", "commercial": "#f4a460", "wood": "#3a7d44",
     "wetland": "#5b8db8", "residential": "#f08080", "farmland": "#c5e1a5",
     "religious": "#ba68c8", "school": "#ef5350", "hospital": "#b71c1c",
-    "other": "#e8e8e8",
+    "other": "#e8e8e8", "park": "#e6c019"
 }
 
-osm_tags = {
+polygon_tags = {
     "landuse": ["residential", "industrial", "commercial", "religious", "farmland", "forest"],
     "amenity": ["school", "hospital", "place_of_worship"],
     "natural":  ["wetland", "wood"],
+    "leisure": ["park", "nature_reserve"]
 }
 
+road_tags = {highway: True for highway in ["motorway", "trunk", "primary", "secondary", "tertiary",
+                                           "service", "unclassified"]}
 
 # OSM load 
 
-if os.path.exists(cache):
-    gdf = gpd.read_file(cache)
+if os.path.exists(polygon_cache):
+    gdf = gpd.read_file(polygon_cache)
 else:
-    gdf = ox.features_from_place("Bentonville, Arkansas, USA", osm_tags)
+    gdf = ox.features_from_place("Bentonville, Arkansas, USA", polygon_tags)
     gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].reset_index(drop=True)
     for col in gdf.columns:
         if gdf[col].apply(lambda v: isinstance(v, list)).any():
             gdf = gdf.drop(columns=[col])
-    gdf.to_file(cache, driver="GPKG")
+    gdf.to_file(polygon_cache, driver="GPKG")
 
 gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
 
+if os.path.exists(road_cache):
+    roads=gpd.read_file(road_cache)
+else:
+    roads = ox.features_from_place("Bentonville, Arkansas, USA", road_tags)
+    roads = roads[roads.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
+    roads.to_file(road_cache, driver="GPKG")
 
 # zones
-
 def classify(row):
+    #amenities
     a = row.get("amenity")
     if a == "school":           return "school"
     if a == "hospital":         return "hospital"
     if a == "place_of_worship": return "religious"
+
+    #leisure
+    l = row.get("leisure")
+    if l in ["park", "nature_reserve"]: return "park"
+
+    #landuse
     lu = row.get("landuse")
     lu_map = {"residential": "residential", "industrial": "industrial",
               "commercial": "commercial", "religious": "religious",
               "farmland": "farmland", "forest": "wood"}
     if lu in lu_map: return lu_map[lu]
+
+    #natural
     n = row.get("natural")
     if n == "wetland": return "wetland"
     if n == "wood":    return "wood"
@@ -78,17 +94,34 @@ print(gdf["zone"].value_counts().to_string())
 utm = gdf.estimate_utm_crs()
 gdf = gdf.to_crs(utm)
 
+def classify_road(row):
+    return row.get("highway")
+roads["zone"] = roads.apply(classify_road, axis=1)
+roads["cost"] = roads["zone"].map(noise_costs)
+roads = roads.dropna(subset=["cost"])
+
+roads = roads.to_crs(utm)
+
 
 # zone map
 
 fig, ax = plt.subplots(figsize=(12, 12))
+#zones first
 for zone, grp in gdf.groupby("zone"):
     grp.plot(ax=ax, color=zone_colors.get(zone, "#e8e8e8"), edgecolor="none", alpha=0.85, label=zone)
+#roads next
+roads.plot(
+    ax=ax,
+    color="black",
+    linewidth=0.4,
+    alpha=0.5
+)
 ax.legend(title="Zone", loc="lower right", fontsize=9, framealpha=0.8)
 ax.set_title("Bentonville, AR — Noise Sensitivity Zones", fontsize=14)
 ax.set_axis_off()
 plt.savefig("bentonville_zones.png", dpi=300, bbox_inches="tight")
 plt.close()
+
 
 
 # cost raster
@@ -117,6 +150,14 @@ ax.axis("off")
 plt.savefig("bentonville_cost_surface.png", dpi=300, bbox_inches="tight")
 plt.close()
 
+#roads raster
+roads_raster = rasterize(
+    list(zip(roads.geometry, roads["cost"].astype("float32"))),
+    out_shape=(grid, grid),
+    transform=tfm, fill=0.0, dtype="float32",)
+
+mask = roads_raster > 0
+cost_grid[mask] = np.minimum(cost_grid[mask], roads_raster[mask])
 
 # coordinate helpers
 
